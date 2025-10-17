@@ -1,11 +1,261 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TESTE</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Extrair “NOVOS DOMÍNIOS PARA BLOQUEIO”</title>
+  <link rel="stylesheet" href="estilos/styles.css" />
+
+  <!-- PDF.js (CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  </script>
+
+  <!-- Pyodide (Python no navegador) -->
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js"></script>
 </head>
 <body>
-    TESTE DE CLONAGEM COM O GIT
+  <div class="wrap">
+    <div class="card">
+      <h1>Extrair <i>Novos Domínios para Bloqueio</i> (PDF → lista)</h1>
+      <p class="lead">
+        Carregue um ou mais PDFs (textuais). O app detecta a coluna <b>NOVOS DOMÍNIOS PARA BLOQUEIO</b> e lista apenas esses domínios.
+        Tudo roda local no navegador (GitHub Pages OK).
+      </p>
+
+      <div class="grid">
+        <div>
+          <div class="row">
+            <input id="fileInput" type="file" accept="application/pdf" multiple />
+            <button id="btnProcess">Processar PDFs</button>
+            <span id="fileCount" class="badge">0 arquivo(s)</span>
+          </div>
+
+          <div class="progress"><div id="bar" class="bar"></div></div>
+          <div id="status" class="small">Aguardando arquivos…</div>
+
+          <div class="row opts">
+            <label class="chk"><input id="unique" type="checkbox" checked /> Remover duplicados</label>
+            <label class="chk"><input id="sort" type="checkbox" checked /> Ordenar A→Z</label>
+            <label class="chk"><input id="lower" type="checkbox" checked /> Minúsculas</label>
+          </div>
+
+          <div class="row header-line">
+            <div class="col small">Resultado (<span id="count">0</span> domínios)</div>
+            <div class="right">
+              <button class="secondary" id="btnCopy">Copiar</button>
+              <button id="btnDownload">Baixar TXT</button>
+            </div>
+          </div>
+
+          <textarea id="out" placeholder="Os domínios aparecerão aqui…"></textarea>
+          <div class="small note">Se o PDF for um scan (imagem), faça OCR antes.</div>
+        </div>
+
+        <aside class="side">
+          <div class="panel">
+            <b>Como funciona</b>
+            <ol class="small">
+              <li>Leitura de texto com coordenadas via PDF.js.</li>
+              <li>Python (Pyodide) detecta as posições X dos cabeçalhos
+                <i>DOMÍNIOS JÁ BLOQUEADOS</i> e <i>NOVOS DOMÍNIOS PARA BLOQUEIO</i>.</li>
+              <li>Qualquer token com “cara de domínio” que estiver mais próximo da 3ª coluna entra no resultado.</li>
+            </ol>
+            <div class="small" style="margin-top:8px">
+              Layout diferente? Ajuste a margem de decisão no código (<code>MARGIN_PX</code>) diretamente no Python aqui embutido.
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = s => document.querySelector(s);
+    const fileInput = $("#fileInput");
+    const btnProcess = $("#btnProcess");
+    const statusEl = $("#status");
+    const bar = $("#bar");
+    const fileCount = $("#fileCount");
+    const out = $("#out");
+    const countEl = $("#count");
+    const btnCopy = $("#btnCopy");
+    const btnDownload = $("#btnDownload");
+    const optUnique = $("#unique");
+    const optSort = $("#sort");
+    const optLower = $("#lower");
+
+    let pyodideReadyPromise = null;
+
+    fileInput.addEventListener("change", () => {
+      fileCount.textContent = `${fileInput.files.length} arquivo(s)`;
+      statusEl.textContent = "Pronto para processar.";
+    });
+
+    btnProcess.addEventListener("click", async () => {
+      const files = [...fileInput.files || []];
+      if (!files.length) { alert("Selecione um ou mais PDFs."); return; }
+
+      disableUI(true);
+      out.value = ""; countEl.textContent = "0";
+      setProgress(0, "Inicializando Python…");
+
+      // carrega Pyodide uma vez
+      if (!pyodideReadyPromise) {
+        pyodideReadyPromise = loadPyodide({indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/"})
+          .then(async (pyo) => {
+            // carrega o script Python
+            await pyo.runPythonAsync(pythonCode);
+            return pyo;
+          });
+      }
+      const pyodide = await pyodideReadyPromise;
+
+      const allDomains = [];
+      let totalPages = 0, processedPages = 0;
+
+      // 1) Lê PDFs e coleta itens por página (texto + X/Y)
+      for (const file of files) {
+        const buf = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+        totalPages += pdf.numPages;
+
+        for (let p = 1; p <= pdf.numPages; p++) {
+          const page = await pdf.getPage(p);
+          const tc = await page.getTextContent();
+          const items = tc.items.map(it => ({
+            str: it.str || "",
+            x: (it.transform && typeof it.transform[4] === "number") ? it.transform[4] : 0,
+            y: (it.transform && typeof it.transform[5] === "number") ? it.transform[5] : 0
+          }));
+
+          // 2) Envia esta página para o Python processar, mantendo contexto (últimas colunas)
+          pyodide.globals.set("page_items", pyodide.toPy(items));
+          const res = await pyodide.runPythonAsync("process_page(page_items)");
+          const jsRes = res.toJs();
+          res.destroy();
+
+          // domains
+          allDomains.push(...jsRes.get("domains"));
+          // mantém contexto de colunas detectadas
+          const ctx = jsRes.get("ctx");
+          await pyodide.runPythonAsync(`
+LAST_X_COL2 = ${ctx.get("x2") !== null ? ctx.get("x2") : "None"}
+LAST_X_COL3 = ${ctx.get("x3") !== null ? ctx.get("x3") : "None"}
+          `);
+
+          processedPages++;
+          setProgress(Math.round((processedPages/totalPages)*100), `Processado ${processedPages}/${totalPages} página(s)…`);
+        }
+      }
+
+      // 3) Pós-processamento (JS)
+      let finalList = allDomains;
+      if (optLower.checked) finalList = finalList.map(d => d.toLowerCase());
+      if (optUnique.checked) finalList = [...new Set(finalList)];
+      if (optSort.checked) finalList.sort((a,b)=> a.localeCompare(b, 'pt-BR'));
+
+      out.value = finalList.join("\n");
+      countEl.textContent = String(finalList.length);
+      setProgress(100, "Concluído.");
+      disableUI(false);
+    });
+
+    btnCopy.addEventListener("click", async () => {
+      out.select();
+      try { await navigator.clipboard.writeText(out.value); flash("Copiado!"); }
+      catch { document.execCommand("copy"); flash("Copiado!"); }
+    });
+
+    btnDownload.addEventListener("click", () => {
+      const blob = new Blob([out.value], {type: "text/plain;charset=utf-8"});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "novos-dominios.txt";
+      document.body.appendChild(a);
+      a.click();
+      URL.revokeObjectURL(url);
+      a.remove();
+    });
+
+    function setProgress(pct, msg){
+      bar.style.width = pct + "%";
+      statusEl.textContent = msg;
+    }
+    function flash(msg){
+      const old = statusEl.textContent;
+      statusEl.textContent = msg;
+      setTimeout(()=> statusEl.textContent = old, 1200);
+    }
+    function disableUI(disabled){
+      btnProcess.disabled = disabled;
+      fileInput.disabled = disabled;
+      btnCopy.disabled = disabled;
+      btnDownload.disabled = disabled;
+    }
+
+    // ---------- Python embarcado (executa em Pyodide) ----------
+    const pythonCode = `
+import re, unicodedata
+
+DOMAIN_RE = re.compile(r"\\b(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+(?:[A-Za-z]{2,63})\\b")
+MARGIN_PX = 12  # margem de decisão: o quão mais perto do X da col.3 precisa estar do que da col.2
+
+def _normalize(s: str) -> str:
+    # remove acentos e normaliza espaços
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = " ".join(s.split())
+    return s.upper()
+
+# contexto (memória) das colunas detectadas na última página
+LAST_X_COL2 = None
+LAST_X_COL3 = None
+
+def _find_headers(items):
+    x2 = None
+    x3 = None
+    for it in items:
+        t = _normalize(it.get("str",""))
+        if not t: 
+            continue
+        x = it.get("x", 0)
+        if "DOMINIOS JA BLOQUEADOS" in t:
+            x2 = x
+        if "NOVOS DOMINIOS PARA BLOQUEIO" in t:
+            x3 = x
+    return x2, x3
+
+def process_page(items):
+    global LAST_X_COL2, LAST_X_COL3
+    # 1) tenta achar cabeçalhos nesta página
+    x2, x3 = _find_headers(items)
+    if x2 is not None: LAST_X_COL2 = x2
+    if x3 is not None: LAST_X_COL3 = x3
+
+    hits = []
+    if LAST_X_COL2 is None or LAST_X_COL3 is None:
+        # sem referência de colunas ainda → não arrisca (provável capa/índice)
+        return {"domains": hits, "ctx": {"x2": LAST_X_COL2, "x3": LAST_X_COL3}}
+
+    # 2) percorre itens para achar tokens com cara de domínio e decidir por proximidade
+    for it in items:
+        s = it.get("str","")
+        if not s: 
+            continue
+        found = DOMAIN_RE.findall(s)
+        if not found:
+            continue
+        x = it.get("x", 0)
+        d2 = abs(x - LAST_X_COL2)
+        d3 = abs(x - LAST_X_COL3)
+        if d3 + MARGIN_PX < d2:
+            hits.extend(found)
+
+    return {"domains": hits, "ctx": {"x2": LAST_X_COL2, "x3": LAST_X_COL3}}
+    `;
+  </script>
 </body>
 </html>
